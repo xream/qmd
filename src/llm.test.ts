@@ -7,7 +7,7 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -52,6 +52,109 @@ describe("LlamaCpp.modelExists", () => {
 
     expect(result.exists).toBe(false);
     expect(result.name).toBe("/nonexistent/path/model.gguf");
+  });
+});
+
+describe("LlamaCpp API-backed models", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("embed uses embeddings API when configured", async () => {
+    let calledUrl = "";
+    let calledAuth = "";
+
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      calledUrl = typeof input === "string" ? input : input.toString();
+      const headers = init?.headers as Record<string, string> | undefined;
+      calledAuth = headers?.Authorization || "";
+      return new Response(
+        JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as unknown as typeof fetch;
+
+    const llm = new LlamaCpp({
+      embedApi: {
+        baseUrl: "https://api.example.com/v1",
+        key: "test-key",
+        model: "test-embed-model",
+      },
+    });
+
+    const result = await llm.embed("hello");
+    await llm.dispose();
+
+    expect(calledUrl).toBe("https://api.example.com/v1/embeddings");
+    expect(calledAuth).toBe("Bearer test-key");
+    expect(result).not.toBeNull();
+    expect(result!.model).toBe("test-embed-model");
+    expect(result!.embedding.length).toBe(3);
+  });
+
+  test("expandQuery uses chat completions API when configured", async () => {
+    globalThis.fetch = (async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "lex: auth setup\nvec: authentication token refresh flow\nhyde: complete authentication guide" } }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as unknown as typeof fetch;
+
+    const llm = new LlamaCpp({
+      queryApi: {
+        baseUrl: "https://api.example.com/v1",
+        key: "test-key",
+        model: "test-query-model",
+      },
+    });
+
+    const result = await llm.expandQuery("authentication setup", { includeLexical: false });
+    await llm.dispose();
+
+    expect(result.length).toBeGreaterThan(0);
+    expect(result.every((item) => item.type !== "lex")).toBe(true);
+    expect(result.some((item) => item.type === "vec")).toBe(true);
+  });
+
+  test("rerank uses rerank API when configured", async () => {
+    let body: any = null;
+
+    globalThis.fetch = (async (_input: any, init?: RequestInit) => {
+      body = init?.body ? JSON.parse(String(init.body)) : null;
+      return new Response(
+        JSON.stringify({
+          results: [
+            { index: 1, relevance_score: 0.9 },
+            { index: 0, relevance_score: 0.1 },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as unknown as typeof fetch;
+
+    const llm = new LlamaCpp({
+      rerankApi: {
+        baseUrl: "https://api.example.com/v1",
+        key: "test-key",
+        model: "test-rerank-model",
+      },
+    });
+
+    const result = await llm.rerank("auth", [
+      { file: "a.md", text: "alpha" },
+      { file: "b.md", text: "beta" },
+    ]);
+    await llm.dispose();
+
+    expect(body.model).toBe("test-rerank-model");
+    expect(Array.isArray(body.documents)).toBe(true);
+    expect(result.model).toBe("test-rerank-model");
+    expect(result.results[0]?.file).toBe("b.md");
+    expect(result.results[1]?.file).toBe("a.md");
   });
 });
 
@@ -556,4 +659,3 @@ describe("LLM Session Management", () => {
     });
   });
 });
-

@@ -8,6 +8,25 @@
 # Use this for universal search instructions or patterns
 global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
 
+# Optional API model overrides (per capability).
+# If a capability is fully configured here (base_url + key + model),
+# QMD will call that API instead of the built-in local GGUF model.
+# If not configured, QMD keeps using local models.
+#
+# models:
+#   embed:
+#     base_url: "https://api.example.com/v1"
+#     key: "sk-..."
+#     model: "text-embedding-3-large"
+#   query:
+#     base_url: "https://api.example.com/v1"
+#     key: "sk-..."
+#     model: "gpt-4o-mini"
+#   rerank:
+#     base_url: "https://api.example.com/v1"
+#     key: "sk-..."
+#     model: "rerank-v3.5"
+
 # Collection definitions
 collections:
   # Meeting notes

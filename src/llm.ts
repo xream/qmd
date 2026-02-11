@@ -17,6 +17,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { loadConfig, type ApiModelConfig as ConfigApiModelConfig } from "./collections.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -167,6 +168,12 @@ export type RerankDocument = {
   title?: string;
 };
 
+export type ApiModelRuntimeConfig = {
+  baseUrl: string;
+  key: string;
+  model: string;
+};
+
 // =============================================================================
 // Model Configuration
 // =============================================================================
@@ -192,6 +199,35 @@ export type PullResult = {
   sizeBytes: number;
   refreshed: boolean;
 };
+
+type ResolvedApiModelConfigs = {
+  embedApi: ApiModelRuntimeConfig | null;
+  queryApi: ApiModelRuntimeConfig | null;
+  rerankApi: ApiModelRuntimeConfig | null;
+};
+
+function normalizeApiModelConfig(config?: ConfigApiModelConfig): ApiModelRuntimeConfig | null {
+  const baseUrl = config?.base_url?.trim();
+  const key = config?.key?.trim();
+  const model = config?.model?.trim();
+  if (!baseUrl || !key || !model) {
+    return null;
+  }
+  return {
+    baseUrl: baseUrl.replace(/\/+$/, ""),
+    key,
+    model,
+  };
+}
+
+function resolveApiModelConfigsFromYaml(): ResolvedApiModelConfigs {
+  const config = loadConfig();
+  return {
+    embedApi: normalizeApiModelConfig(config.models?.embed),
+    queryApi: normalizeApiModelConfig(config.models?.query),
+    rerankApi: normalizeApiModelConfig(config.models?.rerank),
+  };
+}
 
 type HfRef = {
   repo: string;
@@ -327,6 +363,9 @@ export type LlamaCppConfig = {
   embedModel?: string;
   generateModel?: string;
   rerankModel?: string;
+  embedApi?: ApiModelRuntimeConfig | null;
+  queryApi?: ApiModelRuntimeConfig | null;
+  rerankApi?: ApiModelRuntimeConfig | null;
   modelCacheDir?: string;
   /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
@@ -363,6 +402,9 @@ export class LlamaCpp implements LLM {
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
+  private embedApi: ApiModelRuntimeConfig | null;
+  private queryApi: ApiModelRuntimeConfig | null;
+  private rerankApi: ApiModelRuntimeConfig | null;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -383,6 +425,9 @@ export class LlamaCpp implements LLM {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
+    this.embedApi = config.embedApi || null;
+    this.queryApi = config.queryApi || null;
+    this.rerankApi = config.rerankApi || null;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
@@ -635,6 +680,243 @@ export class LlamaCpp implements LLM {
     return this.rerankContext;
   }
 
+  private buildApiUrl(baseUrl: string, path: string): string {
+    const normalizedBase = baseUrl.replace(/\/+$/, "");
+    const normalizedPath = path.replace(/^\/+/, "");
+    return `${normalizedBase}/${normalizedPath}`;
+  }
+
+  private async postApiJson(
+    url: string,
+    apiConfig: ApiModelRuntimeConfig,
+    payload: Record<string, unknown>
+  ): Promise<unknown> {
+    const authHeader = apiConfig.key.toLowerCase().startsWith("bearer ")
+      ? apiConfig.key
+      : `Bearer ${apiConfig.key}`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authHeader,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      const snippet = body ? ` - ${body.slice(0, 300)}` : "";
+      throw new Error(`API request failed (${response.status} ${response.statusText})${snippet}`);
+    }
+
+    try {
+      return await response.json();
+    } catch {
+      throw new Error("API returned non-JSON response");
+    }
+  }
+
+  private parseQueryablesFromText(rawText: string, query: string, includeLexical: boolean): Queryable[] {
+    const lines = rawText.trim().split("\n");
+    const queryTerms = query
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+
+    const hasQueryTerm = (text: string): boolean => {
+      const lower = text.toLowerCase();
+      if (queryTerms.length === 0) return true;
+      return queryTerms.some(term => lower.includes(term));
+    };
+
+    const queryables: Queryable[] = lines
+      .map(line => {
+        const colonIdx = line.indexOf(":");
+        if (colonIdx === -1) return null;
+        const type = line.slice(0, colonIdx).trim();
+        if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+        const text = line.slice(colonIdx + 1).trim();
+        if (!text || !hasQueryTerm(text)) return null;
+        return { type: type as QueryType, text };
+      })
+      .filter((q): q is Queryable => q !== null);
+
+    return includeLexical ? queryables : queryables.filter(q => q.type !== "lex");
+  }
+
+  private buildExpandFallback(query: string, includeLexical: boolean): Queryable[] {
+    const fallback: Queryable[] = [
+      { type: "hyde", text: `Information about ${query}` },
+      { type: "lex", text: query },
+      { type: "vec", text: query },
+    ];
+    return includeLexical ? fallback : fallback.filter(q => q.type !== "lex");
+  }
+
+  private buildExpandErrorFallback(query: string, includeLexical: boolean): Queryable[] {
+    const fallback: Queryable[] = [{ type: "vec", text: query }];
+    if (includeLexical) {
+      fallback.unshift({ type: "lex", text: query });
+    }
+    return fallback;
+  }
+
+  private async embedWithApi(text: string): Promise<EmbeddingResult> {
+    if (!this.embedApi) {
+      throw new Error("Embed API config is missing");
+    }
+    const payload = await this.postApiJson(
+      this.buildApiUrl(this.embedApi.baseUrl, "/embeddings"),
+      this.embedApi,
+      {
+        model: this.embedApi.model,
+        input: text,
+      }
+    ) as { data?: Array<{ embedding?: unknown[] }> };
+
+    const rawEmbedding = payload.data?.[0]?.embedding;
+    if (!Array.isArray(rawEmbedding)) {
+      throw new Error("Embedding API response missing data[0].embedding");
+    }
+    const embedding = rawEmbedding.map((value) => Number(value));
+    if (embedding.some((value) => !Number.isFinite(value))) {
+      throw new Error("Embedding API returned non-numeric embedding values");
+    }
+
+    return {
+      embedding,
+      model: this.embedApi.model,
+    };
+  }
+
+  private extractCompletionText(response: unknown): string | null {
+    const data = response as {
+      choices?: Array<{
+        text?: unknown;
+        message?: { content?: unknown };
+      }>;
+    };
+    const choice = data.choices?.[0];
+    if (!choice) return null;
+    if (typeof choice.text === "string") return choice.text;
+
+    const content = choice.message?.content;
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      const merged = content
+        .map((part) => {
+          if (typeof part === "string") return part;
+          if (part && typeof part === "object" && "text" in part) {
+            const text = (part as { text?: unknown }).text;
+            return typeof text === "string" ? text : "";
+          }
+          return "";
+        })
+        .join("");
+      return merged || null;
+    }
+    return null;
+  }
+
+  private async generateWithApi(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult> {
+    if (!this.queryApi) {
+      throw new Error("Query API config is missing");
+    }
+    const payload = await this.postApiJson(
+      this.buildApiUrl(this.queryApi.baseUrl, "/chat/completions"),
+      this.queryApi,
+      {
+        model: this.queryApi.model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: options.temperature ?? 0.7,
+        max_tokens: options.maxTokens ?? 150,
+      }
+    );
+
+    const text = this.extractCompletionText(payload);
+    if (!text) {
+      throw new Error("Chat completion API response missing choices[0].message.content");
+    }
+
+    return {
+      text,
+      model: this.queryApi.model,
+      done: true,
+    };
+  }
+
+  private async rerankWithApi(query: string, documents: RerankDocument[]): Promise<RerankResult> {
+    if (!this.rerankApi) {
+      throw new Error("Rerank API config is missing");
+    }
+    if (documents.length === 0) {
+      return { results: [], model: this.rerankApi.model };
+    }
+
+    const payload = await this.postApiJson(
+      this.buildApiUrl(this.rerankApi.baseUrl, "/rerank"),
+      this.rerankApi,
+      {
+        model: this.rerankApi.model,
+        query,
+        documents: documents.map((doc) => doc.text),
+        top_n: documents.length,
+        return_documents: false,
+      }
+    ) as {
+      results?: Array<{ index?: number; score?: number; relevance_score?: number; document_index?: number }>;
+      data?: Array<{ index?: number; score?: number; relevance_score?: number; document_index?: number }>;
+      scores?: number[];
+    };
+
+    const entries = Array.isArray(payload.results)
+      ? payload.results
+      : (Array.isArray(payload.data) ? payload.data : []);
+
+    let results: RerankDocumentResult[] = entries
+      .map((entry) => {
+        const index = typeof entry.index === "number"
+          ? entry.index
+          : (typeof entry.document_index === "number" ? entry.document_index : -1);
+        const score = typeof entry.relevance_score === "number"
+          ? entry.relevance_score
+          : (typeof entry.score === "number" ? entry.score : NaN);
+        if (index < 0 || index >= documents.length || !Number.isFinite(score)) {
+          return null;
+        }
+        return {
+          file: documents[index]!.file,
+          score,
+          index,
+        };
+      })
+      .filter((item): item is RerankDocumentResult => item !== null);
+
+    if (results.length === 0 && Array.isArray(payload.scores)) {
+      results = payload.scores
+        .map((score, index) => {
+          if (!Number.isFinite(score) || index >= documents.length) return null;
+          return {
+            file: documents[index]!.file,
+            score,
+            index,
+          };
+        })
+        .filter((item): item is RerankDocumentResult => item !== null);
+    }
+
+    if (results.length === 0) {
+      throw new Error("Rerank API response missing valid ranked results");
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    return {
+      results,
+      model: this.rerankApi.model,
+    };
+  }
+
   // ==========================================================================
   // Tokenization
   // ==========================================================================
@@ -679,6 +961,10 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     try {
+      if (this.embedApi) {
+        return await this.embedWithApi(text);
+      }
+
       const context = await this.ensureEmbedContext();
       const embedding = await context.getEmbeddingFor(text);
 
@@ -701,6 +987,19 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     if (texts.length === 0) return [];
+
+    if (this.embedApi) {
+      return await Promise.all(
+        texts.map(async (text) => {
+          try {
+            return await this.embedWithApi(text);
+          } catch (error) {
+            console.error("Embedding API error for text:", error);
+            return null;
+          }
+        })
+      );
+    }
 
     try {
       const context = await this.ensureEmbedContext();
@@ -732,6 +1031,15 @@ export class LlamaCpp implements LLM {
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
+
+    if (this.queryApi) {
+      try {
+        return await this.generateWithApi(prompt, options);
+      } catch (error) {
+        console.error("Generate API error:", error);
+        return null;
+      }
+    }
 
     // Ensure model is loaded
     await this.ensureGenerateModel();
@@ -792,11 +1100,37 @@ export class LlamaCpp implements LLM {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
+    const includeLexical = options.includeLexical ?? true;
+    const contextHint = options.context?.trim();
+
+    if (this.queryApi) {
+      const prompt = [
+        "Expand this search query into variants for retrieval.",
+        "Return one item per line in exactly this format: <type>: <text>",
+        includeLexical
+          ? 'Allowed <type>: lex, vec, hyde'
+          : 'Allowed <type>: vec, hyde',
+        "Do not output extra commentary, bullets, markdown, or numbering.",
+        contextHint ? `Additional context: ${contextHint}` : "",
+        `Query: ${query}`,
+      ].filter(Boolean).join("\n");
+
+      try {
+        const generated = await this.generateWithApi(prompt, {
+          maxTokens: 600,
+          temperature: 0.3,
+        });
+        const parsed = this.parseQueryablesFromText(generated.text, query, includeLexical);
+        if (parsed.length > 0) return parsed;
+        return this.buildExpandFallback(query, includeLexical);
+      } catch (error) {
+        console.error("API query expansion failed:", error);
+        return this.buildExpandErrorFallback(query, includeLexical);
+      }
+    }
+
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();
-
-    const includeLexical = options.includeLexical ?? true;
-    const context = options.context;
 
     const grammar = await llama.createGrammar({
       grammar: `
@@ -830,42 +1164,12 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
-
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      if (filtered.length > 0) return filtered;
-
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      const parsed = this.parseQueryablesFromText(result, query, includeLexical);
+      if (parsed.length > 0) return parsed;
+      return this.buildExpandFallback(query, includeLexical);
     } catch (error) {
       console.error("Structured query expansion failed:", error);
-      // Fallback to original query
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
+      return this.buildExpandErrorFallback(query, includeLexical);
     } finally {
       await genContext.dispose();
     }
@@ -878,6 +1182,10 @@ export class LlamaCpp implements LLM {
   ): Promise<RerankResult> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
+
+    if (this.rerankApi) {
+      return await this.rerankWithApi(query, documents);
+    }
 
     const context = await this.ensureRerankContext();
 
@@ -1179,12 +1487,21 @@ export function canUnloadLLM(): boolean {
 
 let defaultLlamaCpp: LlamaCpp | null = null;
 
+function getDefaultLlamaCppConfig(): LlamaCppConfig {
+  const apiConfigs = resolveApiModelConfigsFromYaml();
+  return {
+    embedApi: apiConfigs.embedApi,
+    queryApi: apiConfigs.queryApi,
+    rerankApi: apiConfigs.rerankApi,
+  };
+}
+
 /**
  * Get the default LlamaCpp instance (creates one if needed)
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = new LlamaCpp(getDefaultLlamaCppConfig());
   }
   return defaultLlamaCpp;
 }

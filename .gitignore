@@ -7,6 +7,7 @@ texts/
 .github/
 *.md
 !README.md
+!MODEL_API_CONFIG.md
 !CLAUDE.md
 !skills/**/*.md
 !finetune/*.md

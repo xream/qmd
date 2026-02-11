@@ -32,10 +32,30 @@ export interface Collection {
 }
 
 /**
+ * API model configuration for one capability (embed/query/rerank).
+ * If all fields are present, QMD uses remote API for that capability.
+ */
+export interface ApiModelConfig {
+  base_url?: string;
+  key?: string;
+  model?: string;
+}
+
+/**
+ * Optional API model configuration per capability.
+ */
+export interface ModelConfig {
+  embed?: ApiModelConfig;
+  query?: ApiModelConfig;
+  rerank?: ApiModelConfig;
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
+  models?: ModelConfig;                       // Optional API model overrides
   collections: Record<string, Collection>;    // Collection name -> config
 }
 
