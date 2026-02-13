@@ -220,7 +220,7 @@ function normalizeApiModelConfig(config?: ConfigApiModelConfig): ApiModelRuntime
   };
 }
 
-function resolveApiModelConfigsFromYaml(): ResolvedApiModelConfigs {
+export function resolveApiModelConfigsFromYaml(): ResolvedApiModelConfigs {
   const config = loadConfig();
   return {
     embedApi: normalizeApiModelConfig(config.models?.embed),
@@ -273,8 +273,8 @@ export async function pullModels(
     const entries = readdirSync(cacheDir, { withFileTypes: true });
     const cached = filename
       ? entries
-          .filter((entry) => entry.isFile() && entry.name.includes(filename))
-          .map((entry) => join(cacheDir, entry.name))
+        .filter((entry) => entry.isFile() && entry.name.includes(filename))
+        .map((entry) => join(cacheDir, entry.name))
       : [];
 
     if (hfRef && filename) {

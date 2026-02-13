@@ -65,7 +65,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveApiModelConfigsFromYaml } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2338,20 +2338,30 @@ if (import.meta.main) {
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
+      const apiConfigs = resolveApiModelConfigsFromYaml();
+      const allModels: { uri: string; name: string; skipped: boolean }[] = [
+        { uri: DEFAULT_EMBED_MODEL_URI, name: "embed", skipped: !!apiConfigs.embedApi },
+        { uri: DEFAULT_GENERATE_MODEL_URI, name: "generate", skipped: !!apiConfigs.queryApi },
+        { uri: DEFAULT_RERANK_MODEL_URI, name: "rerank", skipped: !!apiConfigs.rerankApi },
       ];
+      const models = allModels.filter(m => !m.skipped).map(m => m.uri);
+      const skipped = allModels.filter(m => m.skipped);
       console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
-        refresh,
-        cacheDir: DEFAULT_MODEL_CACHE_DIR,
-      });
-      for (const result of results) {
-        const size = formatBytes(result.sizeBytes);
-        const note = result.refreshed ? "refreshed" : "cached/checked";
-        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+      for (const s of skipped) {
+        console.log(`${c.dim}- ${s.name}: skipped (remote API configured)${c.reset}`);
+      }
+      if (models.length > 0) {
+        const results = await pullModels(models, {
+          refresh,
+          cacheDir: DEFAULT_MODEL_CACHE_DIR,
+        });
+        for (const result of results) {
+          const size = formatBytes(result.sizeBytes);
+          const note = result.refreshed ? "refreshed" : "cached/checked";
+          console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+        }
+      } else {
+        console.log(`${c.dim}All models use remote API — nothing to pull.${c.reset}`);
       }
       break;
     }
